@@ -1,44 +1,45 @@
 import streamlit as st
-from datetime import date
+from datetime import date, datetime
 from calculator import Trip, find_earliest_application_date, check_candidate_date
-from st_supabase_connection import SupabaseConnection
+from st_supabase_connection import SupabaseConnection, execute_query
 
+
+# -------------------------
+# Helpers
+# -------------------------
 
 def format_date_uk(d: date) -> str:
     """Format with weekday in UK style, e.g. 'Tuesday 02/12/2025'."""
     return d.strftime("%A %d/%m/%Y")
 
-# Initialise Supabase connection (cached by Streamlit)
-supabase_conn = st.connection("supabase", type=SupabaseConnection)
 
+# -------------------------
+# Page + Supabase setup
+# -------------------------
+
+st.set_page_config(page_title="UK Citizenship Absence Checker", page_icon="🇬🇧")
+
+# Initialise Supabase connection (cached by Streamlit; creds from .streamlit/secrets.toml)
+supabase_conn = st.connection("supabase", type=SupabaseConnection, ttl=None)
+
+# Small developer-only check so you can see if Supabase is alive
 with st.expander("🐞 Developer debug: test Supabase connection"):
     try:
-        from st_supabase_connection import SupabaseConnection, execute_query
-
-        # Create cached connection (uses secrets.toml)
-        st_supabase = st.connection(
-            name="supabase_connection",
-            type=SupabaseConnection,
-            ttl=None,  # cache the client indefinitely
-        )
-
-        # Simple test query against the demo table
         rows = execute_query(
-            st_supabase.table("mytable").select("*"),
-            ttl="10m",  # cache results for 10 minutes
+            supabase_conn.table("trips").select("*"),  # change to "mytable" if needed
+            ttl="10m",
         )
-
         st.success("Connected to Supabase successfully 🎉")
-        st.write("Rows from mytable:")
-        st.write(rows)  # rows is usually a list of dicts
-
+        st.write("Rows from `trips` table (if any):")
+        st.write(rows)
     except Exception as e:
         st.error("Could not connect to Supabase.")
         st.exception(e)
 
 
-
-st.set_page_config(page_title="UK Citizenship Absence Checker", page_icon="🇬🇧")
+# -------------------------
+# Title + intro
+# -------------------------
 
 st.title("🇬🇧🇮🇹 Ari's App — UK Citizenship Absence Checker")
 st.caption("Helper for EU / EEA citizens with pre-settled or settled status.")
@@ -61,8 +62,40 @@ It uses **whole days abroad** only — **departure and arrival days do *not* cou
 
 st.header("1. Enter your trips outside the UK")
 
+# First run in this browser session: try to load trips from Supabase
 if "trips" not in st.session_state:
-    st.session_state.trips = []
+    try:
+        resp = (
+            supabase_conn
+            .table("trips")                # Supabase table name
+            .select("*")
+            .order("start_date")
+            .execute()
+        )
+        rows = resp.data or []
+
+        trips = []
+        for row in rows:
+            start = row["start_date"]
+            end = row["end_date"]
+
+            # Supabase normally gives date objects, but be defensive
+            if isinstance(start, str):
+                start = datetime.fromisoformat(start).date()
+            if isinstance(end, str):
+                end = datetime.fromisoformat(end).date()
+
+            note = row.get("note") or ""
+            trips.append(Trip(start=start, end=end, note=note))
+
+        st.session_state.trips = trips
+
+    except Exception as e:
+        st.session_state.trips = []
+        st.warning(
+            "Could not load saved trips from Supabase. "
+            "Starting with an empty list instead."
+        )
 
 with st.form("add_trip_form"):
     col1, col2 = st.columns(2)
@@ -90,13 +123,36 @@ with st.form("add_trip_form"):
         if end < start:
             st.error("Return date cannot be before start date.")
         else:
-            st.session_state.trips.append(
-                Trip(start=start, end=end, note=note.strip())
-            )
+            clean_note = note.strip()
+
+            # 1) Add to local state
+            new_trip = Trip(start=start, end=end, note=clean_note)
+            st.session_state.trips.append(new_trip)
+
             label = f"{format_date_uk(start)} → {format_date_uk(end)}"
-            if note.strip():
-                label += f" — {note.strip()}"
+            if clean_note:
+                label += f" — {clean_note}"
             st.success(f"Added trip: {label}")
+
+            # 2) Persist to Supabase (best-effort)
+            try:
+                (
+                    supabase_conn
+                    .table("trips")
+                    .insert(
+                        {
+                            "start_date": start.isoformat(),
+                            "end_date": end.isoformat(),
+                            "note": clean_note or None,
+                        }
+                    )
+                    .execute()
+                )
+            except Exception as e:
+                st.warning(
+                    "Trip added locally but could not be saved to Supabase. "
+                    f"(Details: {e})"
+                )
 
 # -------------------------
 # 2. LIST TRIPS (NEWEST FIRST) + DELETE BUTTONS
@@ -105,9 +161,9 @@ with st.form("add_trip_form"):
 if st.session_state.trips:
     st.subheader("Your trips")
 
-    # keep original indices so delete works correctly
+    # Keep original indices so delete works correctly
     indexed_trips = list(enumerate(st.session_state.trips))
-    # sort by start date DESC (newest first)
+    # Sort by start date DESC (newest first)
     indexed_trips.sort(key=lambda it: it[1].start, reverse=True)
 
     for display_idx, (orig_idx, t) in enumerate(indexed_trips, start=1):
@@ -121,7 +177,7 @@ if st.session_state.trips:
                 f"{format_date_uk(t.start)} → {format_date_uk(t.end)}"
             )
             bullet_lines = []
-            if t.note:
+            if getattr(t, "note", None):
                 bullet_lines.append(f"- Note: _{t.note}_")
             bullet_lines.append(
                 f"- Full days abroad counted as absences: **{days}**"
@@ -131,8 +187,26 @@ if st.session_state.trips:
 
         with col_btn:
             if st.button("Delete", key=f"del_{orig_idx}"):
-                # delete from the underlying list using original index
-                del st.session_state.trips[orig_idx]
+                # Remove from local state using original index
+                removed = st.session_state.trips.pop(orig_idx)
+
+                # Also try to remove matching row(s) from Supabase
+                try:
+                    (
+                        supabase_conn
+                        .table("trips")
+                        .delete()
+                        .eq("start_date", removed.start)
+                        .eq("end_date", removed.end)
+                        .eq("note", removed.note or None)
+                        .execute()
+                    )
+                except Exception as e:
+                    st.warning(
+                        "Trip deleted locally but could not be deleted from Supabase. "
+                        f"(Details: {e})"
+                    )
+
                 st.rerun()
 
     with st.expander("How are absence days counted?"):
