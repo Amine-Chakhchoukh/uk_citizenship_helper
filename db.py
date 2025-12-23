@@ -14,18 +14,21 @@ def _extract_data(res: Any) -> List[Dict[str, Any]]:
         return []
     if isinstance(res, dict):
         return res.get("data", []) or []
-    # APIResponse from supabase-py
     data = getattr(res, "data", None)
     return data or []
 
 
-def fetch_trips(supabase, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    q = supabase.table("trips").select("*").order("start_date", desc=True)
-    if user_id:
-        q = q.eq("user_id", user_id)
+def fetch_trips(supabase, user_id: str) -> List[Dict[str, Any]]:
+    """
+    Fetch trips for one user (newest first).
+    """
+    q = (
+        supabase.table("trips")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("start_date", desc=True)
+    )
 
-    # Depending on st_supabase_connection version, this may or may not require .execute()
-    # We'll try .execute() first; if it errors, fall back to raw.
     try:
         res = q.execute()
     except Exception:
@@ -39,15 +42,20 @@ def insert_trip(
     start: date,
     end: date,
     note: str = "",
-    user_id: Optional[str] = None,
+    user_id: str = "",
 ) -> Dict[str, Any]:
+    """
+    Insert one trip for one user.
+    """
+    if not user_id:
+        raise ValueError("user_id is required to insert a trip.")
+
     payload: Dict[str, Any] = {
-        "start_date": start.isoformat(),  # IMPORTANT: dates must be JSON-serialisable
+        "user_id": user_id,
+        "start_date": start.isoformat(),
         "end_date": end.isoformat(),
         "note": note or None,
     }
-    if user_id:
-        payload["user_id"] = user_id
 
     try:
         res = supabase.table("trips").insert(payload).execute()
@@ -58,8 +66,16 @@ def insert_trip(
     return data[0] if data else {}
 
 
-def delete_trip(supabase, trip_id: int) -> None:
+def delete_trip(supabase, trip_id: int, user_id: str) -> None:
+    """
+    Delete one trip, scoped to the user.
+    """
+    if not user_id:
+        raise ValueError("user_id is required to delete a trip.")
+
+    q = supabase.table("trips").delete().eq("id", trip_id).eq("user_id", user_id)
+
     try:
-        supabase.table("trips").delete().eq("id", trip_id).execute()
+        q.execute()
     except Exception:
-        supabase.table("trips").delete().eq("id", trip_id)
+        q
