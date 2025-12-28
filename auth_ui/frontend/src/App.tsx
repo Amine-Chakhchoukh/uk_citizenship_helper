@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import "./App.css";
 import type { Session } from "@supabase/supabase-js";
 import { supabase } from "./supabaseClient";
@@ -57,16 +57,28 @@ function ProviderButton({
   );
 }
 
+function isValidEmail(e: string) {
+  // simple + practical (not RFC-perfect)
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e.trim());
+}
+
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loadingSession, setLoadingSession] = useState(true);
+
   const [email, setEmail] = useState("");
+  const [sendingLink, setSendingLink] = useState(false);
+  const [magicSentTo, setMagicSentTo] = useState<string | null>(null);
+
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session ?? null);
-      setLoading(false);
-    });
+    supabase.auth
+      .getSession()
+      .then(({ data }) => {
+        setSession(data.session ?? null);
+      })
+      .finally(() => setLoadingSession(false));
 
     const { data: sub } = supabase.auth.onAuthStateChange((_event, newSession) => {
       setSession(newSession);
@@ -75,30 +87,72 @@ export default function App() {
     return () => sub.subscription.unsubscribe();
   }, []);
 
+  // Clear transient UI messages when session changes (e.g., user signs in)
+  useEffect(() => {
+    if (session) {
+      setErrorMsg(null);
+      setMagicSentTo(null);
+    }
+  }, [session]);
+
+  const canSendMagic = useMemo(() => {
+    if (sendingLink || loadingSession) return false;
+    if (!isValidEmail(email)) return false;
+    return true;
+  }, [email, sendingLink, loadingSession]);
+
   const signInWithGoogle = async () => {
+    setErrorMsg(null);
+    setMagicSentTo(null);
+
     const { error } = await supabase.auth.signInWithOAuth({
       provider: "google",
       options: { redirectTo: window.location.origin },
     });
-    if (error) {
-      console.error(error);
-      alert(error.message);
-    }
+
+    if (error) setErrorMsg(error.message);
   };
 
   const signOut = async () => {
+    setErrorMsg(null);
+    setMagicSentTo(null);
+
     const { error } = await supabase.auth.signOut();
-    if (error) {
-      console.error(error);
-      alert(error.message);
-    }
+    if (error) setErrorMsg(error.message);
   };
 
   const continueWithEmail = async () => {
-    // Not wired yet — this is just UI for now.
-    // If you want, next step is: enable Email provider in Supabase + magic link here.
-    alert("Email sign-in not wired yet. We can add magic link next.");
+    setErrorMsg(null);
+    setMagicSentTo(null);
+
+    const trimmed = email.trim();
+    if (!isValidEmail(trimmed)) {
+      setErrorMsg("Please enter a valid email address.");
+      return;
+    }
+
+    setSendingLink(true);
+    try {
+      const { error } = await supabase.auth.signInWithOtp({
+        email: trimmed,
+        options: {
+          // where Supabase should send the user back after they click the email link
+          emailRedirectTo: window.location.origin,
+        },
+      });
+
+      if (error) {
+        setErrorMsg(error.message);
+        return;
+      }
+
+      setMagicSentTo(trimmed);
+    } finally {
+      setSendingLink(false);
+    }
   };
+
+  const isAuthed = !!session && !loadingSession;
 
   return (
     <div className="page">
@@ -115,60 +169,131 @@ export default function App() {
           </div>
         </div>
 
-        {/* Session status */}
-        {!loading && session && (
-          <div className="finePrint" style={{ marginTop: 4 }}>
-            ✅ Signed in as <b>{session.user.email}</b>{" "}
+        {/* Status / feedback */}
+        {!loadingSession && session && (
+          <div className="finePrint" style={{ marginTop: 8, textAlign: "left" }}>
+            ✅ Signed in as <b>{session.user.email}</b>
             <button
               type="button"
               onClick={signOut}
-              style={{ marginLeft: 12 }}
+              style={{
+                marginLeft: 12,
+                border: "1px solid #e6e6e6",
+                background: "#fff",
+                borderRadius: 8,
+                padding: "6px 10px",
+                cursor: "pointer",
+              }}
             >
               Sign out
             </button>
           </div>
         )}
 
-        <div className="stack">
-          <ProviderButton
-            icon={<GoogleIcon />}
-            label={loading ? "Loading…" : session ? "Continue with Google" : "Continue with Google"}
-            onClick={signInWithGoogle}
-            disabled={loading}
-          />
-        </div>
+        {magicSentTo && !session && (
+          <div
+            className="finePrint"
+            style={{
+              marginTop: 10,
+              textAlign: "left",
+              background: "#f6ffed",
+              border: "1px solid #b7eb8f",
+              color: "#135200",
+              padding: "10px 12px",
+              borderRadius: 10,
+            }}
+          >
+            ✅ Magic link sent to <b>{magicSentTo}</b>. Check your inbox and click
+            the link to sign in.
+          </div>
+        )}
 
-        <div className="divider" aria-hidden="true">
-          <span />
-          <span className="or">or</span>
-          <span />
-        </div>
+        {errorMsg && (
+          <div
+            className="finePrint"
+            style={{
+              marginTop: 10,
+              textAlign: "left",
+              background: "#fff1f0",
+              border: "1px solid #ffa39e",
+              color: "#a8071a",
+              padding: "10px 12px",
+              borderRadius: 10,
+            }}
+          >
+            {errorMsg}
+          </div>
+        )}
 
-        <label className="field">
-          <div className="fieldLabel">Email</div>
-          <input
-            className="input"
-            placeholder="Enter your email address…"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-          />
-        </label>
+        {/* If you're signed in, you usually don't need to show the login UI */}
+        {!isAuthed && (
+          <>
+            <div className="stack">
+              <ProviderButton
+                icon={<GoogleIcon />}
+                label={loadingSession ? "Loading…" : "Continue with Google"}
+                onClick={signInWithGoogle}
+                disabled={loadingSession}
+              />
+            </div>
 
-        <button className="primaryBtn" type="button" onClick={continueWithEmail}>
-          Continue
-        </button>
+            <div className="divider" aria-hidden="true">
+              <span />
+              <span className="or">or</span>
+              <span />
+            </div>
 
-        <div className="finePrint">
-          By continuing, you agree to our{" "}
-          <a href="#" onClick={(e) => e.preventDefault()}>
-            Terms
-          </a>{" "}
-          and{" "}
-          <a href="#" onClick={(e) => e.preventDefault()}>
-            Privacy Policy
-          </a>
-          .
-        </div>
+            <label className="field">
+              <div className="fieldLabel">Email</div>
+              <input
+                className="input"
+                placeholder="Enter your email address…"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                disabled={sendingLink || loadingSession}
+              />
+            </label>
+
+            <button
+              className="primaryBtn"
+              type="button"
+              onClick={continueWithEmail}
+              disabled={!canSendMagic}
+              style={{
+                opacity: !canSendMagic ? 0.6 : 1,
+                cursor: !canSendMagic ? "not-allowed" : "pointer",
+              }}
+            >
+              {sendingLink ? "Sending link…" : "Continue"}
+            </button>
+
+            <div className="finePrint">
+              By continuing, you agree to our{" "}
+              <a href="#" onClick={(e) => e.preventDefault()}>
+                Terms
+              </a>{" "}
+              and{" "}
+              <a href="#" onClick={(e) => e.preventDefault()}>
+                Privacy Policy
+              </a>
+              .
+            </div>
+          </>
+        )}
+
+        {/* Post-login placeholder (Phase 1) */}
+        {isAuthed && (
+          <div style={{ marginTop: 18 }}>
+            <div className="divider" aria-hidden="true" style={{ marginTop: 10 }}>
+              <span />
+              <span className="or">your trips</span>
+              <span />
+            </div>
+            <div className="finePrint" style={{ textAlign: "left" }}>
+              Next: we’ll show the trips UI below this (still on the same page).
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
